@@ -20,8 +20,11 @@
 #define LORA_ADDR 100
 
 // How often a report goes out. UWB ranges ~5-10x per second; 1Hz keeps a walking
-// person smooth on the map while leaving the LoRa channel mostly idle (~70ms airtime).
+// person smooth on the map. Each report is ONE radio packet (~37 of the E32's 58 bytes,
+// ~30ms on air at 19.2kbps), so the channel stays >95% idle. A random +/-150ms jitter
+// keeps several nodes from locking into the same slot and colliding every second.
 #define REPORT_MS 1000
+#define REPORT_JITTER_MS 150
 
 // A distance older than this is reported as 0 ("unknown") instead of silently reusing
 // a stale value - otherwise one lost anchor freezes a wrong position on screen.
@@ -33,11 +36,15 @@
 // ---------------------------------------------------------------------------
 // Pins
 // ---------------------------------------------------------------------------
+// E32 pins. The E32 has M0, M1 and AUX (no "M2"). These used to be named M0/M1/M2 and
+// passed to LoRa_E32(serial, auxPin, m0Pin, m1Pin) in that order - so by position GPIO13
+// has always been the library's AUX, 27 its M0 and 12 its M1. The gateway uses the same
+// mapping. Names now match what the library actually does with each pin.
 #define LORA_TX 25
 #define LORA_RX 26
-#define LORA_M1 27
-#define LORA_M2 12
-#define LORA_M0 13
+#define LORA_AUX 13
+#define LORA_M0 27
+#define LORA_M1 12
 constexpr uint8_t LORA_CHANNEL = 0x19;
 
 #define PIN_RST 16
@@ -53,7 +60,7 @@ constexpr uint8_t LORA_CHANNEL = 0x19;
 // Uncomment to enable debug prints for motion & gesture
 // #define DEBUG_MOTION
 
-LoRa_E32 lora(&Serial1, LORA_M0, LORA_M1, LORA_M2);
+LoRa_E32 lora(&Serial1, LORA_AUX, LORA_M0, LORA_M1);
 Adafruit_BMP280 bme;
 Adafruit_MPU6050 mpu;
 bool hasBmp = false;
@@ -124,29 +131,20 @@ void newRange()
 void newDevice(DW1000Device *device) {}
 void inactiveDevice(DW1000Device *device) {}
 
-// Set LoRa module mode by controlling M0 and M1 pins
-void setLoRaMode(uint8_t m0, uint8_t m1)
-{
-  digitalWrite(LORA_M0, m0);
-  digitalWrite(LORA_M1, m1);
-  delay(100); // allow mode switch
-}
-
 bool initLora()
 {
-  pinMode(LORA_M0, OUTPUT);
-  pinMode(LORA_M1, OUTPUT);
-  pinMode(LORA_M2, OUTPUT);
-  digitalWrite(LORA_M2, LOW);
-
-  // Programming mode: M0=HIGH, M1=LOW
-  setLoRaMode(HIGH, LOW);
+  // The library drives M0/M1 itself (program mode for the config write, normal mode after)
+  // and waits on AUX before each send, so the module is never written to while busy.
   Serial1.begin(9600, SERIAL_8N1, LORA_RX, LORA_TX);
-
   if (!lora.begin())
     return false;
 
   ResponseStructContainer c = lora.getConfiguration();
+  if (c.status.code != 1)
+  {
+    c.close();
+    return false;
+  }
   Configuration config = *(Configuration *)c.data;
   c.close();
 
@@ -164,11 +162,26 @@ bool initLora()
   config.SPED.uartBaudRate = UART_BPS_9600;
   config.SPED.uartParity = MODE_00_8N1;
 
-  lora.setConfiguration(config, WRITE_CFG_PWR_DWN_LOSE);
+  return lora.setConfiguration(config, WRITE_CFG_PWR_DWN_LOSE).code == 1;
+}
 
-  // Normal mode: M0=LOW, M1=LOW
-  setLoRaMode(LOW, LOW);
-  return true;
+// Report frame, sized to fit a single E32 air packet (58 bytes incl. the 3-byte address
+// header of fixed transmission). Longer payloads get split in two, and losing either half
+// loses the report - that, not the send rate, is what made fast reporting unreliable.
+//
+//   ~I,T,P,G,M,A,B,C,S*XX^
+//     I node id   T temp C   P pressure hPa   G 1 standing / 0 lying   M 1 moving
+//     A,B,C range to each anchor in whole cm (0 = no fresh range)
+//     S sequence 0-255 (lets the hub measure packet loss)
+//     XX XOR of every character between '~' and '*', 2 hex digits
+//
+// The gateway checks XX, drops bad frames, and republishes as the usual JSON on MQTT.
+uint8_t frameChecksum(const char *body, size_t n)
+{
+  uint8_t x = 0;
+  for (size_t i = 0; i < n; i++)
+    x ^= (uint8_t)body[i];
+  return x;
 }
 
 float readBatteryVoltage()
@@ -192,6 +205,7 @@ void setup()
   // A missing radio must not brick the tag: keep ranging (and printing) without it.
   for (int attempt = 0; attempt < 3 && !hasLora; attempt++)
     hasLora = initLora();
+  randomSeed(esp_random());
   Serial.println(hasLora ? "LoRa initialized" : "LoRa init FAILED - running without uplink");
 
   SPI.begin(SPI_SCK, SPI_MISO, SPI_MOSI, 33);
@@ -224,10 +238,13 @@ void loop()
   DW1000Ranging.loop();
 
   static uint32_t lastSend = 0;
+  static uint32_t interval = REPORT_MS;
+  static uint8_t seq = 0;
   const uint32_t now = millis();
-  if (now - lastSend < REPORT_MS)
+  if (now - lastSend < interval)
     return;
   lastSend = now;
+  interval = REPORT_MS + random(-REPORT_JITTER_MS, REPORT_JITTER_MS + 1);
 
   int gesture = 1; // 1=standing, 0=laying
   bool moving = false;
@@ -277,14 +294,18 @@ void loop()
       P = (int)lroundf(p / 100.0f);
   }
 
-  // Keep the payload short: the E32 sends 58 bytes per air packet.
-  char payload[96];
-  snprintf(payload, sizeof(payload),
-           "~{\"I\":%d,\"T\":%d,\"P\":%d,\"G\":%d,\"M\":%d,\"U\":[%.2f,%.2f,%.2f]}^",
-           NODE_ID, T, P, gesture, moving ? 1 : 0,
-           freshRange(0, now), freshRange(1, now), freshRange(2, now));
+  auto cm = [&](int i) { return (int)lroundf(freshRange(i, now) * 100.0f); };
+  char body[48];
+  const int n = snprintf(body, sizeof(body), "%d,%d,%d,%d,%d,%d,%d,%d,%u",
+                         NODE_ID, T, P, gesture, moving ? 1 : 0, cm(0), cm(1), cm(2), seq++);
+  char payload[56];
+  snprintf(payload, sizeof(payload), "~%s*%02X^", body, frameChecksum(body, n));
 
   if (hasLora)
-    lora.sendBroadcastFixedMessage(LORA_CHANNEL, String(payload));
+  {
+    ResponseStatus rs = lora.sendBroadcastFixedMessage(LORA_CHANNEL, String(payload));
+    if (rs.code != 1)
+      Serial.printf("LoRa send failed: %s\n", rs.getResponseDescription().c_str());
+  }
   Serial.println(payload);
 }
