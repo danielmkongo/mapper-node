@@ -25,7 +25,7 @@
 
 // A distance older than this is reported as 0 ("unknown") instead of silently reusing
 // a stale value - otherwise one lost anchor freezes a wrong position on screen.
-#define RANGE_STALE_MS 3000
+#define RANGE_STALE_MS 1500
 
 // Loop watchdog: reboot if the main loop ever stops for this long.
 #define LOOP_WDT_SECONDS 15
