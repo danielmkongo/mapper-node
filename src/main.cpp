@@ -19,11 +19,11 @@
 // LoRa radio address of this node (E32 fixed-transmission addressing).
 #define LORA_ADDR 100
 
-// How often a report goes out. UWB ranges ~5-10x per second; 1Hz keeps a walking
-// person smooth on the map. Each report is ONE radio packet (~37 of the E32's 58 bytes,
-// ~30ms on air at 19.2kbps), so the channel stays >95% idle. A random +/-150ms jitter
-// keeps several nodes from locking into the same slot and colliding every second.
-#define REPORT_MS 1000
+// How often a report goes out. UWB ranges ~5-10x per second; each report carries the latest
+// ones. Each report is ONE radio packet (~37 of the E32's 58 bytes, ~30ms on air at
+// 19.2kbps). 5 s keeps the gateway's E32 link reliable (1 s lost frames in the field).
+// A random +/-150ms jitter keeps several nodes from locking into the same slot and colliding.
+#define REPORT_MS 5000
 #define REPORT_JITTER_MS 150
 
 // A distance older than this is reported as 0 ("unknown") instead of silently reusing
